@@ -9,11 +9,19 @@ import matplotlib.ticker as ticker
 import pandas as pd
 import typing as T
 import pulp
+import os
+import networkx as nx
+import ast
+from data.datasets import Tree
+from sklearn.model_selection import GroupKFold
+from torch_geometric.utils import to_networkx
+from itertools import combinations
 from pathlib import Path
 from myopic_mces.myopic_mces import MCES
 from rdkit.Chem import AllChem as Chem
 from rdkit.Chem import DataStructs, Draw
 from rdkit.Chem.Descriptors import ExactMolWt
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from huggingface_hub import hf_hub_download
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import TemplateProcessing
@@ -21,6 +29,7 @@ from standardizeUtils.standardizeUtils import (
     standardize_structure_with_pubchem,
     standardize_structure_list_with_pubchem,
 )
+
 
 
 def load_massspecgym():
@@ -310,3 +319,187 @@ class MyopicMCES():
         )
         dist = retval[1]
         return dist
+    
+
+def parse_paths_from_df(df):
+    all_tree_paths = []
+
+    # first init the defaultdict with all precursor_mz values
+    all_precursor_mz = []
+    for ms_level, precursor_mz, smi in zip(df["ms_level"], df["precursor_mz"], df["smiles"]):
+        # use ms_level to detect when a spectrum is MS2
+        if int(ms_level) == 2:
+            all_precursor_mz.append(precursor_mz)
+            all_tree_paths.append([smi, precursor_mz, []])
+
+    # then iterate over the df and when msn_precursor_mzs is NaN, go to the next item in all_tree_paths
+    # assuming that the first ms_level == 2
+    idx_cur_precursors_mz = -1
+    for _, row in df.iterrows():
+        if int(row["ms_level"]) == 2:
+            # if the spectrum is MS2, go to the next tree
+            idx_cur_precursors_mz += 1
+            continue
+        else:
+            # else add the path at the appropriate index
+            cur_path_group = all_tree_paths[idx_cur_precursors_mz][2]
+            msn_precursor_mzs = ast.literal_eval(row["msn_precursor_mzs"])
+            # replace the first value of msn_precursor_mzs with precursor_mz
+            msn_precursor_mzs[0] = all_precursor_mz[idx_cur_precursors_mz]
+            cur_path_group.append(msn_precursor_mzs)
+
+    return all_tree_paths
+
+
+def find_duplicate_smiles(all_smiles):
+    occurrences = {}  # {smiles1: {path1, path2...}, smiles2: {path1, path2...}...}
+    
+    for dataset_path, smiles_list in all_smiles.items():
+        for smi in smiles_list:
+            if smi in occurrences:
+                # if the specific SMILES is in occurrences, add only the path to it
+                occurrences[smi].add(dataset_path)
+            else:
+                occurrences[smi] = {dataset_path}
+    
+    # Extract items that appear in more than one list
+    duplicates = {smi: paths for smi, paths in occurrences.items() if len(paths) > 1}
+    
+    if duplicates:
+        # Track pairs of paths where duplicates are found
+        path_pairs = {}
+
+        for smi, paths in duplicates.items():
+            for path_pair in combinations(paths, 2):
+                sorted_pair = tuple(sorted(path_pair))
+                if sorted_pair in path_pairs:
+                    path_pairs[sorted_pair].append(smi)
+                else:
+                    path_pairs[sorted_pair] = [smi]
+
+        # Print the duplicates for each pair of files
+        for path_pair, smi_list in path_pairs.items():
+            print(f"""Duplicates found in {path_pair[0]} and {path_pair[1]}:
+{', '.join(smi_list)}\n""")
+    else:
+        print("No duplicates found.")
+
+
+def add_identifiers(df):
+    id_counter = 0
+    id_list = []  
+
+    for _, row in df.iterrows():
+        ms_level = int(row["ms_level"])
+        if ms_level == 2:
+            id_counter += 1
+        # for MSn levels, maintain the ID based on the current precursor_mz group
+
+        msn_id = f"MSnID{id_counter:07d}"
+        id_list.append(msn_id)
+
+    df.insert(0, 'identifier', id_list)
+
+    return df
+
+
+def visualize_MSn_tree(tree_or_pygdata):
+    if isinstance(tree_or_pygdata, Tree):
+        # Convert Tree class to PyG Data
+        data_obj = tree_or_pygdata.to_pyg_data()
+    else:
+        data_obj = tree_or_pygdata
+    # Convert PyG Data to NetworkX graph
+    graph = to_networkx(data_obj, to_undirected=True)
+
+    # Extract node features (assuming "x" contains node features)
+    node_features = data_obj.x.numpy()
+
+    # Draw the graph
+    plt.figure(figsize=(8, 6))
+    pos = nx.spring_layout(graph)  # change to specific for trees
+
+    # Draw nodes with annotations
+    nx.draw(graph, pos, with_labels=True, node_color='skyblue', edge_color='grey',
+            linewidths=1, font_size=10, node_size=500)
+
+    # Annotate nodes with their feature values
+    for node, (x, y) in pos.items():
+        # Create a string representation of node features
+        feature_str = ', '.join(f'{idx}: {val:.2f}' for idx, val in enumerate(node_features[node]))
+        
+        # Display the feature string next to the node
+        plt.text(x, y, s=feature_str, bbox=dict(facecolor='white', alpha=0.7),
+                 horizontalalignment='center', verticalalignment='center')
+
+    # Display the plot
+    plt.show()        
+
+
+def smiles_to_scaffold(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+    scaffold_smiles = Chem.MolToSmiles(scaffold)
+    return scaffold_smiles
+
+
+def train_val_test_split(all_smiles, scaffolds, n_splits=10):
+    X = all_smiles
+    y = np.random.rand(len(all_smiles))  # Dummy target variable
+
+    groups = np.array(scaffolds)
+
+    group_kfold = GroupKFold(n_splits=n_splits)
+
+    train = []
+    validation = []
+    test = []
+
+    # calculate the number of splits for each set based on the ratios
+    n_test_splits = int(n_splits * 0.1)
+    n_val_splits = int(n_splits * 0.1)
+    n_train_splits = n_splits - n_test_splits - n_val_splits
+
+    # ensure that both validation and test splits aren't empty
+    if n_test_splits == 0:
+        n_test_splits = 1
+        n_train_splits -= 1
+
+    if n_val_splits == 0:
+        n_val_splits = 1
+        n_train_splits -= 1
+
+    # perform GroupKFold split
+    for fold_num, (_, test_index) in enumerate(group_kfold.split(X, y, groups=groups)):
+        if fold_num < n_test_splits:
+            test.extend(test_index)
+        elif fold_num < n_test_splits + n_val_splits:
+            validation.extend(test_index)
+        else:
+            train.extend(test_index)
+    
+    return train, validation, test
+
+
+def create_split_file(msn_dataset, train_idxs, val_idxs, test_idxs, filepath):
+    if os.path.exists(filepath):
+        print(f"split tsv file already exists at {filepath}")
+        return
+
+    split_df = pd.DataFrame(columns=["identifier", "fold"])
+    all_indexes = [("train", train_idxs), 
+                   ("val", val_idxs),
+                    ("test", test_idxs)]
+
+    rows = []
+
+    # create the dataframe row by row
+    for fold, split_idxs in all_indexes:
+        for idx in split_idxs:
+            msn_id = msn_dataset.identifiers[idx]
+            rows.append({"identifier": msn_id, "fold": fold})
+
+    # concatenate the rows into the dataframe
+    split_df = pd.concat([split_df, pd.DataFrame(rows)], ignore_index=True)
+    split_df.to_csv(filepath, sep='\t', index=False)
+    print(f"split tsv file was created successfully at {filepath}")

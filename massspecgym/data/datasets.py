@@ -10,8 +10,10 @@ from typing import Optional
 from rdkit import Chem
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import default_collate
+from torch_geometric.data import Data
 from matchms.importing import load_from_mgf
 from massspecgym.data.transforms import SpecTransform, MolTransform, MolToInChIKey
+from massspecgym.utils import add_identifiers, parse_paths_from_df
 
 
 class MassSpecDataset(Dataset):
@@ -204,3 +206,122 @@ class RetrievalDataset(MassSpecDataset):
 
 
 # TODO: Datasets for unlabeled data.
+
+
+class TreeNode:
+    def __init__(self, value):
+        self.value = value
+        self.children = {}
+
+    def add_child(self, child_value):
+        if child_value not in self.children:
+            self.children[child_value] = TreeNode(child_value)
+        return self.children[child_value]
+
+    def get_depth(self):
+        if not self.children:
+            return 0
+        return 1 + max(child.get_depth() for child in self.children.values())
+
+    def get_branching_factor(self):
+        if not self.children:
+            return 0
+        return max(
+            len(self.children),
+            max(child.get_branching_factor() for child in self.children.values())
+            )
+
+    def get_edges(self):
+        edges = []
+        for child in self.children.values():
+            edges.append((self.value, child.value))
+            edges.extend(child.get_edges())
+        return edges
+
+
+class Tree:
+    def __init__(self, root):
+        self.root = TreeNode(root)
+        self.paths = []
+        
+    def add_path(self, path):
+        self.paths.append(path)
+        current_node = self.root
+        for node in path:
+            current_node = current_node.add_child(node)
+
+    def get_depth(self):
+        return self.root.get_depth()
+
+    def get_branching_factor(self):
+        return self.root.get_branching_factor()
+
+    def get_edges(self):
+        # Exclude edges starting and ending at the root node
+        edges = self.root.get_edges()
+        edges = [(u, v) for u, v in edges if u != self.root.value or v != self.root.value]
+        return edges
+    
+    def to_pyg_data(self):
+        edges = self.get_edges()
+
+        # Extract unique node indices
+        nodes_set = set(sum(edges, ()))
+        node_indices = {node: idx for idx, node in enumerate(nodes_set)}
+        
+        # Prepare edge_index tensor
+        edge_index = torch.tensor([[node_indices[edge[0]], node_indices[edge[1]]] for edge in edges],
+                                  dtype=torch.long).t().contiguous()
+
+        # Prepare node features tensor
+        node_list = list(nodes_set)
+        x = torch.tensor(node_list, dtype=torch.float).view(-1, 1)
+
+        # Create Data object
+        data = Data(x=x, edge_index=edge_index)
+
+        return data
+
+
+class MSnDataset(MassSpecDataset):
+    def __init__(self, pth=None, dtype=torch.float32, mol_transform = None):
+        # load dataset using the parent class
+        super().__init__(pth=pth)
+        self.metadata = self.metadata[self.metadata["spectype"] == "ALL_ENERGIES"]
+
+        # TODO: add identifiers (and split?) to the mgf file
+        # add identifiers to the metadata
+        self.metadata = add_identifiers(self.metadata)
+        self.identifiers = np.unique(self.metadata["identifier"])
+
+        # get paths from the metadata
+        dataset_all_tree_paths = parse_paths_from_df(self.metadata)
+
+        # generate trees from paths and ther corresponding MSnIDs
+        self.trees = []
+        self.pyg_trees = []
+        self.smiles = []
+
+        for smi, root, paths in dataset_all_tree_paths:
+            tree = Tree(root)
+            for path in paths:
+                tree.add_path(path)
+
+            pyg_tree = tree.to_pyg_data()
+            self.trees.append(tree)
+            self.pyg_trees.append(pyg_tree)
+            self.smiles.append(smi)
+
+    def __len__(self):
+        return len(self.pyg_trees)
+
+    def __getitem__(self, idx, transform_mol=True):
+        spec_tree = self.pyg_trees[idx]
+        smi = self.smiles[idx]
+
+        mol = self.mol_transform(smi) if transform_mol and self.mol_transform else smi
+        if isinstance(mol, np.ndarray):
+            mol = torch.as_tensor(mol, dtype=self.dtype)
+        
+        item  = {"spec_tree": spec_tree, "mol": mol}
+        return item
