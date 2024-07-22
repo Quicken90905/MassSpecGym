@@ -284,7 +284,7 @@ class Tree:
 
 
 class MSnDataset(MassSpecDataset):
-    def __init__(self, pth=None, dtype=torch.float32, mol_transform = None):
+    def __init__(self, pth=None, dtype=torch.float32, mol_transform=None):
         # load dataset using the parent class
         super().__init__(pth=pth)
         self.metadata = self.metadata[self.metadata["spectype"] == "ALL_ENERGIES"]
@@ -304,9 +304,10 @@ class MSnDataset(MassSpecDataset):
 
         for smi, root, paths in dataset_all_tree_paths:
             tree = Tree(root)
-            for path in paths:
-                tree.add_path(path)
-
+# UNCOMMENT THIS AFTER TESTING WITH ONLY THE ROOT----------------------------------------------------------------------------------------
+            """for path in paths:
+                tree.add_path(path)"""
+# UNCOMMENT THIS AFTER TESTING WITH ONLY THE ROOT----------------------------------------------------------------------------------------
             pyg_tree = tree.to_pyg_data()
             self.trees.append(tree)
             self.pyg_trees.append(pyg_tree)
@@ -325,3 +326,17 @@ class MSnDataset(MassSpecDataset):
         
         item  = {"spec_tree": spec_tree, "mol": mol}
         return item
+    
+    @staticmethod
+    def collate_fn(batch: T.Iterable[dict]) -> dict:
+        """
+        Custom collate function to handle the outputs of __getitem__.
+        """
+        spec_trees = [item['spec_tree'] for item in batch]
+        mols = [item['mol'] for item in batch]
+
+        # Collate the spec_trees and mols using the default collate function
+        batch_spec_trees = default_collate(spec_trees)
+        batch_mols = default_collate(mols)
+
+        return {'spec_tree': batch_spec_trees, 'mol': batch_mols}

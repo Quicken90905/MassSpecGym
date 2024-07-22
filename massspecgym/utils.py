@@ -12,7 +12,7 @@ import pulp
 import os
 import networkx as nx
 import ast
-from data.datasets import Tree
+import massspecgym.data.datasets as msgym_datasets
 from sklearn.model_selection import GroupKFold
 from torch_geometric.utils import to_networkx
 from itertools import combinations
@@ -404,7 +404,7 @@ def add_identifiers(df):
 
 
 def visualize_MSn_tree(tree_or_pygdata):
-    if isinstance(tree_or_pygdata, Tree):
+    if isinstance(tree_or_pygdata, msgym_datasets.Tree):
         # Convert Tree class to PyG Data
         data_obj = tree_or_pygdata.to_pyg_data()
     else:
