@@ -297,6 +297,8 @@ class MSnDataset(MassSpecDataset):
         # get paths from the metadata
         dataset_all_tree_paths = parse_paths_from_df(self.metadata)
 
+        self.mol_transform = mol_transform
+
         # generate trees from paths and ther corresponding MSnIDs
         self.trees = []
         self.pyg_trees = []

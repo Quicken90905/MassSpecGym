@@ -32,7 +32,8 @@ class RetrievalMassSpecGymModel(MassSpecGymModel, ABC):
         self.log(
             f"{stage.to_pref()}loss",
             outputs['loss'],
-            batch_size=batch['spec'].size(0),
+            batch_size=batch['spec'].size(0) if 'spec' in batch else batch['spec_tree'].size(0),
+            # CHANGED FROM '''batch_size=batch['spec'].size(0)''' TO SUPPORT CURRENT IMPLEMENTATION OF MSnDataset---------------------------------
             sync_dist=True,
             prog_bar=True,
         )
@@ -41,8 +42,8 @@ class RetrievalMassSpecGymModel(MassSpecGymModel, ABC):
 
         self.evaluate_retrieval_step(
             outputs["scores"],
-            batch["labels"],
-            batch["batch_ptr"],
+            #batch["labels"], ---------------------------------------UNCOMMENT THIS---------------------------------------------------------------
+            #batch["batch_ptr"], ------------------------------------UNCOMMENT THIS---------------------------------------------------------------
             stage=stage,
         )
         self.evaluate_mces_at_1(
