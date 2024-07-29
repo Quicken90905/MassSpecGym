@@ -10,8 +10,8 @@ import pandas as pd
 import typing as T
 import pulp
 import os
+import uuid
 import networkx as nx
-import ast
 import massspecgym.data.datasets as msgym_datasets
 from sklearn.model_selection import GroupKFold
 from torch_geometric.utils import to_networkx
@@ -319,121 +319,30 @@ class MyopicMCES():
         )
         dist = retval[1]
         return dist
+
+
+def visualize_MSn_tree(tree, figsize=(12, 8)):
+    def add_path_to_graph(graph, path):
+        path_nodes = []
+        for i, label in enumerate(path):
+            label = f"{label:.3f}"
+            parent_nodes = "_".join(path_nodes)
+            node_name = f"{parent_nodes}_{label}" if parent_nodes else label
+            graph.add_node(node_name, label=label)
+            if path_nodes:
+                graph.add_edge(path_nodes[-1], node_name)
+            path_nodes.append(node_name)
+
+    G = nx.DiGraph()
+    for path in tree.paths:
+        add_path_to_graph(G, path)
     
-
-def parse_paths_from_df(df):
-    all_tree_paths = []
-
-    # first init the defaultdict with all precursor_mz values
-    all_precursor_mz = []
-    for ms_level, precursor_mz, smi in zip(df["ms_level"], df["precursor_mz"], df["smiles"]):
-        # use ms_level to detect when a spectrum is MS2
-        if int(ms_level) == 2:
-            all_precursor_mz.append(precursor_mz)
-            all_tree_paths.append([smi, precursor_mz, []])
-
-    # then iterate over the df and when msn_precursor_mzs is NaN, go to the next item in all_tree_paths
-    # assuming that the first ms_level == 2
-    idx_cur_precursors_mz = -1
-    for _, row in df.iterrows():
-        if int(row["ms_level"]) == 2:
-            # if the spectrum is MS2, go to the next tree
-            idx_cur_precursors_mz += 1
-            continue
-        else:
-            # else add the path at the appropriate index
-            cur_path_group = all_tree_paths[idx_cur_precursors_mz][2]
-            msn_precursor_mzs = ast.literal_eval(row["msn_precursor_mzs"])
-            # replace the first value of msn_precursor_mzs with precursor_mz
-            msn_precursor_mzs[0] = all_precursor_mz[idx_cur_precursors_mz]
-            cur_path_group.append(msn_precursor_mzs)
-
-    return all_tree_paths
-
-
-def find_duplicate_smiles(all_smiles):
-    occurrences = {}  # {smiles1: {path1, path2...}, smiles2: {path1, path2...}...}
-    
-    for dataset_path, smiles_list in all_smiles.items():
-        for smi in smiles_list:
-            if smi in occurrences:
-                # if the specific SMILES is in occurrences, add only the path to it
-                occurrences[smi].add(dataset_path)
-            else:
-                occurrences[smi] = {dataset_path}
-    
-    # Extract items that appear in more than one list
-    duplicates = {smi: paths for smi, paths in occurrences.items() if len(paths) > 1}
-    
-    if duplicates:
-        # Track pairs of paths where duplicates are found
-        path_pairs = {}
-
-        for smi, paths in duplicates.items():
-            for path_pair in combinations(paths, 2):
-                sorted_pair = tuple(sorted(path_pair))
-                if sorted_pair in path_pairs:
-                    path_pairs[sorted_pair].append(smi)
-                else:
-                    path_pairs[sorted_pair] = [smi]
-
-        # Print the duplicates for each pair of files
-        for path_pair, smi_list in path_pairs.items():
-            print(f"""Duplicates found in {path_pair[0]} and {path_pair[1]}:
-{', '.join(smi_list)}\n""")
-    else:
-        print("No duplicates found.")
-
-
-def add_identifiers(df):
-    id_counter = 0
-    id_list = []  
-
-    for _, row in df.iterrows():
-        ms_level = int(row["ms_level"])
-        if ms_level == 2:
-            id_counter += 1
-        # for MSn levels, maintain the ID based on the current precursor_mz group
-
-        msn_id = f"MSnID{id_counter:07d}"
-        id_list.append(msn_id)
-
-    df.insert(0, 'identifier', id_list)
-
-    return df
-
-
-def visualize_MSn_tree(tree_or_pygdata):
-    if isinstance(tree_or_pygdata, msgym_datasets.Tree):
-        # Convert Tree class to PyG Data
-        data_obj = tree_or_pygdata.to_pyg_data()
-    else:
-        data_obj = tree_or_pygdata
-    # Convert PyG Data to NetworkX graph
-    graph = to_networkx(data_obj, to_undirected=True)
-
-    # Extract node features (assuming "x" contains node features)
-    node_features = data_obj.x.numpy()
-
-    # Draw the graph
-    plt.figure(figsize=(8, 6))
-    pos = nx.spring_layout(graph)  # change to specific for trees
-
-    # Draw nodes with annotations
-    nx.draw(graph, pos, with_labels=True, node_color='skyblue', edge_color='grey',
-            linewidths=1, font_size=10, node_size=500)
-
-    # Annotate nodes with their feature values
-    for node, (x, y) in pos.items():
-        # Create a string representation of node features
-        feature_str = ', '.join(f'{idx}: {val:.2f}' for idx, val in enumerate(node_features[node]))
-        
-        # Display the feature string next to the node
-        plt.text(x, y, s=feature_str, bbox=dict(facecolor='white', alpha=0.7),
-                 horizontalalignment='center', verticalalignment='center')
-
-    # Display the plot
-    plt.show()        
+    pos = nx.bfs_layout(G, list(G.nodes)[0])
+    labels = {node: G.nodes[node]['label'] for node in G.nodes}
+    plt.figure(figsize=figsize)
+    nx.draw(G, pos, labels=labels, with_labels=True, node_size=3000,
+            node_color="lightblue", font_size=10, font_weight="bold", arrows=True)
+    plt.show() 
 
 
 def smiles_to_scaffold(smiles):
@@ -445,9 +354,7 @@ def smiles_to_scaffold(smiles):
 
 def train_val_test_split(all_smiles, scaffolds, n_splits=10):
     X = all_smiles
-    y = np.random.rand(len(all_smiles))  # Dummy target variable
-
-    groups = np.array(scaffolds)
+    y = np.random.rand(len(all_smiles))  # dummy target variable
 
     group_kfold = GroupKFold(n_splits=n_splits)
 
@@ -470,7 +377,7 @@ def train_val_test_split(all_smiles, scaffolds, n_splits=10):
         n_train_splits -= 1
 
     # perform GroupKFold split
-    for fold_num, (_, test_index) in enumerate(group_kfold.split(X, y, groups=groups)):
+    for fold_num, (_, test_index) in enumerate(group_kfold.split(X, y, groups=np.array(scaffolds))):
         if fold_num < n_test_splits:
             test.extend(test_index)
         elif fold_num < n_test_splits + n_val_splits:

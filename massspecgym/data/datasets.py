@@ -1,4 +1,5 @@
 import pandas as pd
+import ast
 import json
 import typing as T
 import numpy as np
@@ -7,13 +8,11 @@ import matchms
 import massspecgym.utils as utils
 from pathlib import Path
 from typing import Optional
-from rdkit import Chem
 from torch.utils.data.dataset import Dataset
 from torch.utils.data.dataloader import default_collate
 from torch_geometric.data import Data
 from matchms.importing import load_from_mgf
 from massspecgym.data.transforms import SpecTransform, MolTransform, MolToInChIKey
-from massspecgym.utils import add_identifiers, parse_paths_from_df
 
 
 class MassSpecDataset(Dataset):
@@ -213,10 +212,21 @@ class TreeNode:
         self.value = value
         self.children = {}
 
+    def __repr__(self, level=0):
+        ret = "  " * level + repr(self.value) + "\n"
+        for child in self.children.values():
+            ret += child.__repr__(level + 1)
+        return ret
+
     def add_child(self, child_value):
-        if child_value not in self.children:
-            self.children[child_value] = TreeNode(child_value)
-        return self.children[child_value]
+        if child_value in self.children:
+            return self.children[child_value]
+        
+        # Create new child node
+        child_node = TreeNode(child_value)
+        self.children[child_value] = child_node
+        
+        return child_node
 
     def get_depth(self):
         if not self.children:
@@ -243,9 +253,14 @@ class Tree:
     def __init__(self, root):
         self.root = TreeNode(root)
         self.paths = []
+
+    def __repr__(self):
+        return repr(self.root)
         
     def add_path(self, path):
         self.paths.append(path)
+        if path[0] == self.root.value:
+            path = path[1:]  # Skip the root node if it's in the path
         current_node = self.root
         for node in path:
             current_node = current_node.add_child(node)
@@ -285,35 +300,25 @@ class Tree:
 
 class MSnDataset(MassSpecDataset):
     def __init__(self, pth=None, dtype=torch.float32, mol_transform=None):
+        self.mol_transform = mol_transform
+
         # load dataset using the parent class
         super().__init__(pth=pth)
         self.metadata = self.metadata[self.metadata["spectype"] == "ALL_ENERGIES"]
 
         # TODO: add identifiers (and split?) to the mgf file
         # add identifiers to the metadata
-        self.metadata = add_identifiers(self.metadata)
+        self.metadata = self._add_identifiers(self.metadata)
         self.identifiers = np.unique(self.metadata["identifier"])
 
         # get paths from the metadata
-        dataset_all_tree_paths = parse_paths_from_df(self.metadata)
+        self.all_tree_paths = self._parse_paths_from_df(self.metadata)
 
-        self.mol_transform = mol_transform
+        # generate trees from paths and their corresponding SMILES
+        self.trees, self.pyg_trees, self.smiles = self._generate_trees(self.all_tree_paths)
 
-        # generate trees from paths and ther corresponding MSnIDs
-        self.trees = []
-        self.pyg_trees = []
-        self.smiles = []
-
-        for smi, root, paths in dataset_all_tree_paths:
-            tree = Tree(root)
-# UNCOMMENT THIS AFTER TESTING WITH ONLY THE ROOT----------------------------------------------------------------------------------------
-            """for path in paths:
-                tree.add_path(path)"""
-# UNCOMMENT THIS AFTER TESTING WITH ONLY THE ROOT----------------------------------------------------------------------------------------
-            pyg_tree = tree.to_pyg_data()
-            self.trees.append(tree)
-            self.pyg_trees.append(pyg_tree)
-            self.smiles.append(smi)
+        self.tree_depths = self._get_tree_depths(self.trees)
+        self.branching_factors = self._get_branching_factors(self.trees)
 
     def __len__(self):
         return len(self.pyg_trees)
@@ -329,16 +334,70 @@ class MSnDataset(MassSpecDataset):
         item  = {"spec_tree": spec_tree, "mol": mol}
         return item
     
-    @staticmethod
-    def collate_fn(batch: T.Iterable[dict]) -> dict:
-        """
-        Custom collate function to handle the outputs of __getitem__.
-        """
-        spec_trees = [item['spec_tree'] for item in batch]
-        mols = [item['mol'] for item in batch]
+    def _add_identifiers(self, df):
+        id_counter = 0
+        id_list = []  
 
-        # Collate the spec_trees and mols using the default collate function
-        batch_spec_trees = default_collate(spec_trees)
-        batch_mols = default_collate(mols)
+        for _, row in df.iterrows():
+            ms_level = int(row["ms_level"])
+            if ms_level == 2:
+                id_counter += 1
+            # for MSn levels, maintain the ID based on the current precursor_mz group
 
-        return {'spec_tree': batch_spec_trees, 'mol': batch_mols}
+            msn_id = f"MSnID{id_counter:07d}"
+            id_list.append(msn_id)
+
+        df.insert(0, 'identifier', id_list)
+
+        return df
+    
+    def _parse_paths_from_df(self, df):
+        all_tree_paths = []
+
+        # first collect all precursor_mz values
+        all_precursor_mz = []
+        for ms_level, precursor_mz, smi in zip(df["ms_level"], df["precursor_mz"], df["smiles"]):
+            # use ms_level to detect when a spectrum is MS2
+            if int(ms_level) == 2:
+                all_precursor_mz.append(precursor_mz)
+                all_tree_paths.append([smi, precursor_mz, []])
+
+        # then iterate over the df and when msn_precursor_mzs is NaN, go to the next item in all_tree_paths
+        # assuming that the first ms_level == 2
+        idx_cur_precursors_mz = -1
+        for _, row in df.iterrows():
+            if int(row["ms_level"]) == 2:
+                # if the spectrum is MS2, go to the next tree
+                idx_cur_precursors_mz += 1
+                continue
+            else:
+                # else add the path at the appropriate index
+                cur_path_group = all_tree_paths[idx_cur_precursors_mz][2]
+                msn_precursor_mzs = ast.literal_eval(row["msn_precursor_mzs"])
+                # replace the first value of msn_precursor_mzs with precursor_mz
+                msn_precursor_mzs[0] = all_precursor_mz[idx_cur_precursors_mz]
+                cur_path_group.append(msn_precursor_mzs)
+
+        return all_tree_paths
+    
+    def _generate_trees(self, dataset_all_tree_paths):
+        trees = []
+        pyg_trees = []
+        smiles = []
+
+        for smi, root, paths in dataset_all_tree_paths:
+            tree = Tree(root)
+            for path in paths:
+                tree.add_path(path)
+            pyg_tree = tree.to_pyg_data()
+            trees.append(tree)
+            pyg_trees.append(pyg_tree)
+            smiles.append(smi)
+
+        return trees, pyg_trees, smiles
+    
+    def _get_tree_depths(self, trees):
+        return [tree.get_depth() for tree in trees]
+    
+    def _get_branching_factors(self, trees):
+        return [tree.get_branching_factor() for tree in trees]

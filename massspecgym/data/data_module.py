@@ -6,7 +6,7 @@ import massspecgym.utils as utils
 from pathlib import Path
 from typing import Optional
 from torch.utils.data.dataset import Subset
-#from torch.utils.data.dataloader import DataLoader <--- replaced with pytorch_geometric equivalent
+#from torch.utils.data.dataloader import DataLoader # <--- replaced with pytorch_geometric equivalent
 from torch_geometric.loader import DataLoader
 from massspecgym.data.datasets import MassSpecDataset
 
